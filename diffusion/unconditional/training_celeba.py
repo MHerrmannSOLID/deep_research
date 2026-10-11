@@ -1,4 +1,8 @@
 from pathlib import Path
+import sys
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
 import torch
 import matplotlib.pyplot as plt
 from tqdm import tqdm
@@ -11,7 +15,7 @@ from torchvision.transforms import Compose, Resize, RandomHorizontalFlip, ToTens
 from torchvision.utils import save_image
 
 from models.ngu_net import Unet
-from diusion_noise_helper import (
+from diffusion_noise_helper import (
     extract,
     p_losses,
     timesteps,
@@ -197,9 +201,6 @@ save_image(final_grid, 'final_celeba_faces.png', nrow=4)
 print("Saved final un-squished samples to 'final_celeba_faces.png'")
 
 
-
-from pathlib import Path
-import torch
 
 # Ensure checkpoint directory exists
 checkpoint_dir = Path("./checkpoints")
