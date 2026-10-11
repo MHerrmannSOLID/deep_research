@@ -66,11 +66,11 @@ class SinusoidalPositionEmbeddings(nn.Module):
         # Create a vector with the position indices [0 to half_dim-1]
         positions = torch.arange(half_dim, device=device)
         exponents = positions * self.ln_max_period / (half_dim - 1)
-        omeags = torch.exp(-exponents)
-        # time[:, None] has shape (batch_size, 1), while omeags[None, :] has
+        omegas = torch.exp(-exponents)
+        # time[:, None] has shape (batch_size, 1), while omegas[None, :] has
         # shape (1, half_dim). Broadcasting their element-wise product produces
         # one set of frequency samples per batch item: (batch_size, half_dim).
-        samples = time[:, None] * omeags[None, :]
+        samples = time[:, None] * omegas[None, :]
 
         embeddings = torch.cat((samples.sin(), samples.cos()), dim=-1)
         return embeddings
@@ -271,21 +271,26 @@ class Unet(nn.Module):
         self,
         dim, # We start with 'dim' channels after the first layer, and then we expand by `dim_mults`
              # when proceeding down the net. 'dim' sets the global "width" scale of the network.
-        init_dim=None, # Just in case we want a differnt channel count at the input layer.
+        init_dim=None, # Just in case we want a different channel count at the input layer.
         out_dim=None, # The number of output channels. Typically matches the number of input channels
                       # (e.g., 3 for RGB images).
         dim_mults=(1, 2, 4, 8), # Multiplicative factors for the number of channels at each level of the U-Net.
-        channels=3, # initial number if image channel usually 3 for RGB images.
+        channels=3, # initial number of image channels, usually 3 for RGB images.
         self_condition=False, # self conditioning is an optimization where previous time step predictions
                               # are fed back into the model to improve current predictions.
         resnet_block_groups=4, # Number of groups for GroupNorm in ResNet blocks.
+        full_attention_count =2 # Number of full attention in each legs (down / upsample)
     ):
         super().__init__()
-
+        # The original example had only full attention in the bottleneck blocks.
+        # However, since full attention is much more capable than linear attention, one might want (if enough VRAM is available)
+        # to use full attention also in the up and downsampling path, where it can be applied to bigger spatial resolutions.
+        # This might help in stabilizing global connections and between long-distance features.
+        self.full_attention_count = full_attention_count
         self.channels = channels
         self.self_condition = self_condition
         # if we go with self condition, we need double the input channel count, to accommodate the
-        # concatenated previous time step predictions. That means 2 image with e.g. RGB -->6 channels
+        # concatenated previous time step predictions. That means 2 images with e.g. RGB --> 6 channels
         input_channels = channels * (2 if self_condition else 1)
 
         # If we want the first convolutional layer to have a different number of input channels than the default,
@@ -293,27 +298,27 @@ class Unet(nn.Module):
         init_dim = default(init_dim, dim)
         # set the initial convolutional layer's input and output dimensions.
         # This is a 1x1 convolution, but the original paper was having here a 7x7.
-        # Also as u can see it uses `init_dim` for the output channels, So if it was defined in the
-        # parameters i would take affect here, otherwhise is just equal to `dim`.
+        # Also as you can see it uses `init_dim` for the output channels, so if it was defined in the
+        # parameters it would take effect here, otherwise it's just equal to `dim`.
         self.init_conv = nn.Conv2d(input_channels, init_dim, 1, padding=0)
 
-        #here we convert the width paramert dim with the multiplicative factors specified in `dim_mults`
+        # Here we convert the width parameter dim with the multiplicative factors specified in `dim_mults`
         # into the specific channel counts . e.g. if dim=64 and dim_mults=(1,2,4,8),
         # dims would be [init_dim (64), 64, 128, 256, 512]
         dims = [init_dim, *map(lambda m: dim * m, dim_mults)]
         # dims[:-1] -> All elements except the last -> [64, 64, 128, 256]
         # dims[1:] -> All elements except the first -> [64, 128, 256, 512]
-        # And zip pairs them tlement wise -> [(64, 64), (64, 128), (128, 256), (256, 512)]
+        # And zip pairs them element-wise -> [(64, 64), (64, 128), (128, 256), (256, 512)]
         in_out = list(zip(dims[:-1], dims[1:]))
 
-        # This is patially presettings one constructor parameter for the ResnetBlock,
-        # specifically the number of groups for GroupNorm. So when us later use `block_klass` to create ResnetBlocks,
+        # This is partially presetting one constructor parameter for the ResnetBlock,
+        # specifically the number of groups for GroupNorm. So when we later use `block_klass` to create ResnetBlocks,
         # it has already the `groups` parameter set to `resnet_block_groups`. It only needs to be provided with
         # the input and output dimensions when instantiated. see below : 'block_klass(dim_in, dim_in, time_emb_dim=time_dim)'
         block_klass = partial(ResnetBlock, groups=resnet_block_groups)
 
         # time embeddings is the output size of the time MLP.
-        time_dim = dim * 4
+        time_dim = dim * 4        
 
         # This is the nn.Module for processing the time embeddings. It takes a [b, 1] tensor as input which
         # is just one integer per batch element, representing the timestep. This integer is converted into
@@ -337,7 +342,7 @@ class Unet(nn.Module):
         # Similarly, we define a sequential nn.Module list for the decoder, which will store all the upsampling blocks.
         self.ups = nn.ModuleList([])
         # `num_resolutions` represents the number of downsampling/upsampling stages, will be used to identify the
-        # last stage for special handling in the upcomming forloops
+        # last stage for special handling in the upcoming for-loops
         num_resolutions = len(in_out)
 
         # Now we iterate over each resolution level to construct the downsampling blocks.
@@ -348,13 +353,13 @@ class Unet(nn.Module):
         for ind, (dim_in, dim_out) in enumerate(in_out):
             # true if last downsampling stage
             is_last = ind >= (num_resolutions - 1)
-            # the last 2 layer should have full attnetion
-            use_full_attn = ind >= (num_resolutions - 2)
+            # the last 2 layers should have full attention
+            use_full_attn = ind >= (num_resolutions - self.full_attention_count)
             attn_klass = Attention if use_full_attn else LinearAttention
             self.downs.append(
                 nn.ModuleList(
                     [
-                        # this is straightforward: two residual blocks followed come first
+                        # this is straightforward: two residual blocks come first
                         block_klass(dim_in, dim_in, time_emb_dim=time_dim),
                         block_klass(dim_in, dim_in, time_emb_dim=time_dim),
                         # Followed by a linear attention block wrapped in a pre-normalization wrapper
@@ -378,10 +383,10 @@ class Unet(nn.Module):
         # (the downsampling path with the upsampling path).
         mid_dim = dims[-1]
         self.mid_block1 = block_klass(mid_dim, mid_dim, time_emb_dim=time_dim)
-        # A seciality o these center blocks is that due to the low spacial resolution,
-        # we can use the  standard attention (which is O(n^2) in the number of pixels).
+        # A speciality of these center blocks is that due to the low spatial resolution,
+        # we can use the standard attention (which is O(n^2) in the number of pixels).
         # This standard attention is much more potent than linear attention. However,
-        # with high spacial resolution, the standard attention becomes computationally too expensive.
+        # with high spatial resolution, the standard attention becomes computationally too expensive.
         self.mid_attn = Residual(PreNorm(mid_dim, Attention(mid_dim)))
         self.mid_block2 = block_klass(mid_dim, mid_dim, time_emb_dim=time_dim)
 
@@ -389,13 +394,13 @@ class Unet(nn.Module):
         # I won't repeat the detailed comments here, as the structure is analogous to the downsampling path.
         for ind, (dim_in, dim_out) in enumerate(reversed(in_out)):
             is_last = ind == (len(in_out) - 1)
-            use_full_attn = ind < 2
+            use_full_attn = ind < self.full_attention_count
             attn_klass = Attention if use_full_attn else LinearAttention
 
             self.ups.append(
                 nn.ModuleList(
                     [
-                        # Here we have one detail we should pay attentons to!
+                        # Here we have one detail we should pay attention to!
                         # The input size of the residual block is the concatenation of the
                         # corresponding encoder feature map and the current decoder feature map.
                         # This is a property of U-Net architectures, called skip connections.
@@ -442,7 +447,7 @@ class Unet(nn.Module):
         # and then popped off in reverse order during the upsampling phase.
         h = []  # LIFO stack storing intermediate feature maps for encoder-decoder skip connections
 
-        # Downsampling path (encoder) with skip connectionsbeing stored in h.
+        # Downsampling path (encoder) with skip connections being stored in h.
         for block1, block2, attn, downsample in self.downs:
             x = block1(x, t)
             h.append(x) # Store the output of the first block for skip connection
