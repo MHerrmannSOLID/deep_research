@@ -156,7 +156,7 @@ class ResnetBlock(nn.Module):
     #                 (If dim != dim_out, a 1x1 convolution aligns the residual path.)
     #   time_emb_dim: Dimension of the optional time embedding input.
     #   groups      : Number of groups for GroupNorm layers within the blocks.
-    def __init__(self, dim, dim_out, *, time_emb_dim=None, groups=8):
+    def __init__(self, dim, dim_out, *, time_emb_dim=None, groups=8, dropout=0.0):
         super().__init__()
 
         # Time embedding MLP projection:
@@ -170,6 +170,7 @@ class ResnetBlock(nn.Module):
 
         # The two sequential feature blocks
         self.block1 = Block(dim, dim_out, groups=groups)
+        self.dropout = nn.Dropout(dropout)
         self.block2 = Block(dim_out, dim_out, groups=groups)
 
         # Optional 1x1 convolution to match spatial channel dimensions for the residual addition
@@ -193,6 +194,7 @@ class ResnetBlock(nn.Module):
         # Execute Block 1: Receives feature map x (4D tensor) and scale_shift conditioning parameters.
         # Channel gain (scale) and bias (shift) modulate feature activations based on timestep t.
         h = self.block1(x, scale_shift=scale_shift)
+        h = self.dropout(h)
 
         # Execute Block 2: Refines features without re-injecting time embedding.
         h = self.block2(h)
@@ -279,7 +281,10 @@ class Unet(nn.Module):
         self_condition=False, # self conditioning is an optimization where previous time step predictions
                               # are fed back into the model to improve current predictions.
         resnet_block_groups=4, # Number of groups for GroupNorm in ResNet blocks.
-        full_attention_count =2 # Number of full attention in each legs (down / upsample)
+        full_attention_count=2, # Number of full attention in each legs (down / upsample)
+        attn_heads=4, # Number of attention heads for both full and linear attention.
+        attn_dim_head=32, # Dimension per attention head. Total attention hidden dim = attn_heads * attn_dim_head.
+        dropout=0.0, # Dropout rate applied inside each ResnetBlock between the two sub-blocks.
     ):
         super().__init__()
         # The original example had only full attention in the bottleneck blocks.
@@ -315,7 +320,7 @@ class Unet(nn.Module):
         # specifically the number of groups for GroupNorm. So when we later use `block_klass` to create ResnetBlocks,
         # it has already the `groups` parameter set to `resnet_block_groups`. It only needs to be provided with
         # the input and output dimensions when instantiated. see below : 'block_klass(dim_in, dim_in, time_emb_dim=time_dim)'
-        block_klass = partial(ResnetBlock, groups=resnet_block_groups)
+        block_klass = partial(ResnetBlock, groups=resnet_block_groups, dropout=dropout)
 
         # time embeddings is the output size of the time MLP.
         time_dim = dim * 4        
@@ -368,8 +373,7 @@ class Unet(nn.Module):
                         # With num_groups=1, it normalizes across all channels and spatial pixels
                         # independently per sample (Instance/Layer Normalization), without mixing
                         # statistics across batch elements.
-			Residual(PreNorm(dim_in, attn_klass(dim_in))),
-                        #Residual(PreNorm(dim_in, LinearAttention(dim_in))),
+			Residual(PreNorm(dim_in, attn_klass(dim_in, heads=attn_heads, dim_head=attn_dim_head))),
                         # Finally, if we are not in the last downsampling stage, we apply a downsampling operation.
                         # Otherwise, we use a simple convolution to match the output dimensions (regarding the channels).
                         Downsample(dim_in, dim_out)
@@ -387,7 +391,7 @@ class Unet(nn.Module):
         # we can use the standard attention (which is O(n^2) in the number of pixels).
         # This standard attention is much more potent than linear attention. However,
         # with high spatial resolution, the standard attention becomes computationally too expensive.
-        self.mid_attn = Residual(PreNorm(mid_dim, Attention(mid_dim)))
+        self.mid_attn = Residual(PreNorm(mid_dim, Attention(mid_dim, heads=attn_heads, dim_head=attn_dim_head)))
         self.mid_block2 = block_klass(mid_dim, mid_dim, time_emb_dim=time_dim)
 
         # This is same like the downsampling, but with an upsampling operation at the end of each stage instead of downsampling.
@@ -408,7 +412,7 @@ class Unet(nn.Module):
                         # to the output channels of the corresponding encoder blocks.
                         block_klass(dim_out + dim_in, dim_out, time_emb_dim=time_dim),
                         block_klass(dim_out + dim_in, dim_out, time_emb_dim=time_dim),
-			Residual(PreNorm(dim_out, attn_klass(dim_out))),
+			Residual(PreNorm(dim_out, attn_klass(dim_out, heads=attn_heads, dim_head=attn_dim_head))),
                         Upsample(dim_out, dim_in)
                         if not is_last
                         else nn.Conv2d(dim_out, dim_in, 3, padding=1),
