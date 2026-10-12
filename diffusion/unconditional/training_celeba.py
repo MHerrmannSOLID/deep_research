@@ -14,7 +14,7 @@ from torchvision import transforms
 from torchvision.transforms import Compose, Resize, RandomHorizontalFlip, ToTensor, Lambda
 from torchvision.utils import save_image
 
-from models.ngu_net import Unet
+from models.ngu_net import Unet, SinusoidalTimeFiLM
 from diffusion_noise_helper import (
     extract,
     p_losses,
@@ -122,10 +122,16 @@ def postprocess_and_unsquish(tensor_imgs):
 # ---------------------------------------------------------
 # 4. Model, Optimizer, and AMP Setup
 # ---------------------------------------------------------
+dim = 96
+film_dim = dim * 4
+film = SinusoidalTimeFiLM(sinusoidal_dim=dim, film_dim=film_dim)
+
 model = Unet(
-    dim=96,                          # Base feature width (64 channels)
+    dim=dim,                         # Base feature width
     channels=channels,               # 3 RGB channels
-    dim_mults=(1, 2, 4,8)          # Downsamples: 176 -> 88 -> 44 -> 22 -> 11
+    dim_mults=(1, 2, 4, 8),         # Downsamples: 128 -> 64 -> 32 -> 16 -> 8
+    film_module=film,                # Inject time-based FiLM conditioning for diffusion
+    film_dim=film_dim,               # Must match the output dimension of the FiLM module
 )
 model.to(device)
 

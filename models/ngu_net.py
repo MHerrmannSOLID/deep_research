@@ -75,6 +75,22 @@ class SinusoidalPositionEmbeddings(nn.Module):
         embeddings = torch.cat((samples.sin(), samples.cos()), dim=-1)
         return embeddings
 
+class SinusoidalTimeFiLM(nn.Module):
+    """FiLM conditioning module that encodes a scalar timestep into a conditioning vector.
+    Suitable for injection into the Unet via film_module for diffusion training."""
+    def __init__(self, sinusoidal_dim, film_dim):
+        super().__init__()
+        self.mlp = nn.Sequential(
+            SinusoidalPositionEmbeddings(sinusoidal_dim),
+            nn.Linear(sinusoidal_dim, film_dim),
+            nn.GELU(),
+            nn.Linear(film_dim, film_dim),
+        )
+
+    def forward(self, time):
+        return self.mlp(time)
+
+
 class WeightStandardizedConv2d(nn.Conv2d):
     #"""
     #https://arxiv.org/abs/1903.10520
@@ -147,24 +163,24 @@ class Block(nn.Module):
 
 
 class ResnetBlock(nn.Module):
-    # This module executes two blocks (see Block) with optional time embedding conditioning.
+    # This module executes two blocks (see Block) with optional FiLM conditioning.
     # Execution uses a residual connection (input is added to the output of the two blocks).
     #
     # Parameters:
-    #   dim         : Number of input channels to the ResnetBlock.
-    #   dim_out     : Number of output channels from the ResnetBlock.
-    #                 (If dim != dim_out, a 1x1 convolution aligns the residual path.)
-    #   time_emb_dim: Dimension of the optional time embedding input.
-    #   groups      : Number of groups for GroupNorm layers within the blocks.
-    def __init__(self, dim, dim_out, *, time_emb_dim=None, groups=8, dropout=0.0):
+    #   dim      : Number of input channels to the ResnetBlock.
+    #   dim_out  : Number of output channels from the ResnetBlock.
+    #              (If dim != dim_out, a 1x1 convolution aligns the residual path.)
+    #   film_dim : Dimension of the optional FiLM conditioning embedding (e.g. from time, class, or joint embeddings).
+    #   groups   : Number of groups for GroupNorm layers within the blocks.
+    def __init__(self, dim, dim_out, *, film_dim=None, groups=8, dropout=0.0):
         super().__init__()
 
-        # Time embedding MLP projection:
-        # Activates the embedding (SiLU) and projects it to twice the output dimension (dim_out * 2)
+        # FiLM projection:
+        # Activates the conditioning embedding (SiLU) and projects it to twice the output dimension (dim_out * 2)
         # using a linear layer so it can later be split into scale and shift parameters.
         self.mlp = (
-            nn.Sequential(nn.SiLU(), nn.Linear(time_emb_dim, dim_out * 2))
-            if exists(time_emb_dim)
+            nn.Sequential(nn.SiLU(), nn.Linear(film_dim, dim_out * 2))
+            if exists(film_dim)
             else None
         )
 
@@ -176,27 +192,27 @@ class ResnetBlock(nn.Module):
         # Optional 1x1 convolution to match spatial channel dimensions for the residual addition
         self.res_conv = nn.Conv2d(dim, dim_out, 1) if dim != dim_out else nn.Identity()
 
-    def forward(self, x, time_emb=None):
+    def forward(self, x, film_emb=None):
         scale_shift = None  # Holds the (scale, shift) tuple for FiLM modulation
 
-        # Process the time embedding through the MLP projection if both exist
-        if exists(self.mlp) and exists(time_emb):
-            # 1. Project time embedding: shape goes from (B, time_emb_dim) -> (B, dim_out * 2)
-            time_emb = self.mlp(time_emb)
+        # Process the FiLM conditioning embedding through the MLP projection if both exist
+        if exists(self.mlp) and exists(film_emb):
+            # 1. Project FiLM embedding: shape goes from (B, film_dim) -> (B, dim_out * 2)
+            film_emb = self.mlp(film_emb)
 
             # 2. Expand to 4D tensor (B, dim_out * 2, 1, 1) to enable spatial broadcasting
             #    across feature maps (B, C, H, W) in Block
-            time_emb = rearrange(time_emb, "b c -> b c 1 1")
+            film_emb = rearrange(film_emb, "b c -> b c 1 1")
 
             # 3. Split channels into two equal halves: scale (B, dim_out, 1, 1) and shift (B, dim_out, 1, 1)
-            scale_shift = time_emb.chunk(2, dim=1)
+            scale_shift = film_emb.chunk(2, dim=1)
 
         # Execute Block 1: Receives feature map x (4D tensor) and scale_shift conditioning parameters.
-        # Channel gain (scale) and bias (shift) modulate feature activations based on timestep t.
+        # Scale and shift modulate feature activations based on the FiLM conditioning signal.
         h = self.block1(x, scale_shift=scale_shift)
         h = self.dropout(h)
 
-        # Execute Block 2: Refines features without re-injecting time embedding.
+        # Execute Block 2: Refines features without re-injecting the conditioning.
         h = self.block2(h)
 
         # Residual Connection: Adds input features (transformed via 1x1 conv if channels change)
@@ -285,6 +301,10 @@ class Unet(nn.Module):
         attn_heads=4, # Number of attention heads for both full and linear attention.
         attn_dim_head=32, # Dimension per attention head. Total attention hidden dim = attn_heads * attn_dim_head.
         dropout=0.0, # Dropout rate applied inside each ResnetBlock between the two sub-blocks.
+        film_module=None, # Injectable nn.Module for FiLM conditioning (e.g. time embeddings, class embeddings, or both).
+                          # If None, the U-Net operates without any conditioning (e.g. for segmentation).
+        film_dim=None, # Output dimension of the film_module. Must be provided when film_module is not None.
+                       # Each ResnetBlock projects from film_dim to its local channel count internally.
     ):
         super().__init__()
         # The original example had only full attention in the bottleneck blocks.
@@ -316,31 +336,17 @@ class Unet(nn.Module):
         # And zip pairs them element-wise -> [(64, 64), (64, 128), (128, 256), (256, 512)]
         in_out = list(zip(dims[:-1], dims[1:]))
 
-        # This is partially presetting one constructor parameter for the ResnetBlock,
+        # This is partially presetting constructor parameters for the ResnetBlock,
         # specifically the number of groups for GroupNorm. So when we later use `block_klass` to create ResnetBlocks,
         # it has already the `groups` parameter set to `resnet_block_groups`. It only needs to be provided with
-        # the input and output dimensions when instantiated. see below : 'block_klass(dim_in, dim_in, time_emb_dim=time_dim)'
+        # the input and output dimensions when instantiated. see below : 'block_klass(dim_in, dim_in, film_dim=film_dim)'
         block_klass = partial(ResnetBlock, groups=resnet_block_groups, dropout=dropout)
 
-        # time embeddings is the output size of the time MLP.
-        time_dim = dim * 4        
-
-        # This is the nn.Module for processing the time embeddings. It takes a [b, 1] tensor as input which
-        # is just one integer per batch element, representing the timestep. This integer is converted into
-        # a sinusoidal positional embedding by the `SinusoidalPositionEmbeddings` module and pushed through a
-        # small MLP to transform it into the final time embedding.
-        # The result of this MLP will later be provided to each ResnetBlock as the time embedding,
-        # where it is projected to match the local channel dimensions of that block.
-        self.time_mlp = nn.Sequential(
-            # First, calculate the deterministic sinusoidal position pattern of size `dim`.
-            SinusoidalPositionEmbeddings(dim),
-            # Expand the deterministic pattern into a higher-dimensional space (`time_dim`) with a learnable linear layer.
-            nn.Linear(dim, time_dim),
-            # Apply GELU non-linearity to allow complex non-linear temporal representations.
-            nn.GELU(),
-            # Output the processed time embedding vector of size `time_dim`, ready for distribution to all ResnetBlocks.
-            nn.Linear(time_dim, time_dim),
-        )
+        # FiLM conditioning module (injectable, default None).
+        # When provided (e.g. for diffusion), it transforms raw conditioning input (timesteps, class labels, ...)
+        # into a (B, film_dim) embedding that is distributed to every ResnetBlock for FiLM modulation.
+        # When None (e.g. for segmentation), no conditioning is applied and the U-Net acts as a pure encoder-decoder.
+        self.film_module = film_module
 
         # Here we define a sequential nn.Module list for the encoder. This will store all the downsampling blocks.
         self.downs = nn.ModuleList([])
@@ -365,8 +371,8 @@ class Unet(nn.Module):
                 nn.ModuleList(
                     [
                         # this is straightforward: two residual blocks come first
-                        block_klass(dim_in, dim_in, time_emb_dim=time_dim),
-                        block_klass(dim_in, dim_in, time_emb_dim=time_dim),
+                        block_klass(dim_in, dim_in, film_dim=film_dim),
+                        block_klass(dim_in, dim_in, film_dim=film_dim),
                         # Followed by a linear attention block wrapped in a pre-normalization wrapper
                         # and a residual skip connection.
                         # PreNorm applies GroupNorm before passing features to LinearAttention.
@@ -386,13 +392,13 @@ class Unet(nn.Module):
         # Now we are in the middle of the U-Net ! This part will connect the encoder with the decoder
         # (the downsampling path with the upsampling path).
         mid_dim = dims[-1]
-        self.mid_block1 = block_klass(mid_dim, mid_dim, time_emb_dim=time_dim)
+        self.mid_block1 = block_klass(mid_dim, mid_dim, film_dim=film_dim)
         # A speciality of these center blocks is that due to the low spatial resolution,
         # we can use the standard attention (which is O(n^2) in the number of pixels).
         # This standard attention is much more potent than linear attention. However,
         # with high spatial resolution, the standard attention becomes computationally too expensive.
         self.mid_attn = Residual(PreNorm(mid_dim, Attention(mid_dim, heads=attn_heads, dim_head=attn_dim_head)))
-        self.mid_block2 = block_klass(mid_dim, mid_dim, time_emb_dim=time_dim)
+        self.mid_block2 = block_klass(mid_dim, mid_dim, film_dim=film_dim)
 
         # This is same like the downsampling, but with an upsampling operation at the end of each stage instead of downsampling.
         # I won't repeat the detailed comments here, as the structure is analogous to the downsampling path.
@@ -410,8 +416,8 @@ class Unet(nn.Module):
                         # This is a property of U-Net architectures, called skip connections.
                         # Therefore, the input channels for the decoder blocks are doubled compared
                         # to the output channels of the corresponding encoder blocks.
-                        block_klass(dim_out + dim_in, dim_out, time_emb_dim=time_dim),
-                        block_klass(dim_out + dim_in, dim_out, time_emb_dim=time_dim),
+                        block_klass(dim_out + dim_in, dim_out, film_dim=film_dim),
+                        block_klass(dim_out + dim_in, dim_out, film_dim=film_dim),
 			Residual(PreNorm(dim_out, attn_klass(dim_out, heads=attn_heads, dim_head=attn_dim_head))),
                         Upsample(dim_out, dim_in)
                         if not is_last
@@ -423,13 +429,14 @@ class Unet(nn.Module):
         # we default to the number of input channels.
         self.out_dim = default(out_dim, channels)
 
-        self.final_res_block = block_klass(dim * 2, dim, time_emb_dim=time_dim)
+        self.final_res_block = block_klass(dim * 2, dim, film_dim=film_dim)
         # The final convolution layer maps the features to the desired output dimension.
         self.final_conv = nn.Conv2d(dim, self.out_dim, 1)
 
     # The forward method defines how input data flows through the network.
-    # It takes the input image `x`, the timestep `time`, and an optional self-conditioning input `x_self_cond`.
-    def forward(self, x, time, x_self_cond=None):
+    # It takes the input image `x`, an optional FiLM conditioning input `film_cond` (e.g. timesteps),
+    # and an optional self-conditioning input `x_self_cond`.
+    def forward(self, x, film_cond=None, x_self_cond=None):
 
         # If self-conditioning is enabled, concatenate the previous prediction with the input along the channel dimension.
         if self.self_condition:
@@ -440,8 +447,9 @@ class Unet(nn.Module):
         x = self.init_conv(x)
         r = x.clone()  # Keep a copy of the initial features for a final residual skip connection at the very end.
 
-        # Process the timestep integer through the time MLP to produce a `time_dim` conditioning vector.
-        t = self.time_mlp(time)
+        # Process the raw conditioning input through the FiLM module to produce a (B, film_dim) embedding.
+        # If no film_module was injected, f stays None and ResnetBlocks skip FiLM modulation entirely.
+        f = self.film_module(film_cond) if exists(self.film_module) and exists(film_cond) else None
 
         # U-Net skip connections preserve high-resolution spatial details from the encoder (downsampling)
         # to the decoder (upsampling).
@@ -453,29 +461,29 @@ class Unet(nn.Module):
 
         # Downsampling path (encoder) with skip connections being stored in h.
         for block1, block2, attn, downsample in self.downs:
-            x = block1(x, t)
+            x = block1(x, f)
             h.append(x) # Store the output of the first block for skip connection
 
-            x = block2(x, t)
+            x = block2(x, f)
             x = attn(x)
             h.append(x) # Store the output of the second block for skip connection
 
             x = downsample(x)
 
         # Middle (bottleneck) part of the U-Net, where the feature maps have the lowest spatial resolution.
-        x = self.mid_block1(x, t)
+        x = self.mid_block1(x, f)
         x = self.mid_attn(x)
-        x = self.mid_block2(x, t)
+        x = self.mid_block2(x, f)
 
         # Upsampling path (decoder) with skip connections being retrieved from h in reverse order.
         for block1, block2, attn, upsample in self.ups:
             # Concatenate the corresponding encoder feature map for the first block in the decoder stage.
             x = torch.cat((x, h.pop()), dim=1)
-            x = block1(x, t)
+            x = block1(x, f)
 
             # Concatenate the corresponding encoder feature map for the second block in the decoder stage.
             x = torch.cat((x, h.pop()), dim=1)
-            x = block2(x, t)
+            x = block2(x, f)
             x = attn(x)
 
             x = upsample(x)
@@ -483,7 +491,7 @@ class Unet(nn.Module):
         x = torch.cat((x, r), dim=1) # Here we are at the very top again, and we concatenate
                                      # the initial features for a final residual skip connection.
 
-        x = self.final_res_block(x, t)
+        x = self.final_res_block(x, f)
         return self.final_conv(x)
 
 ######### Here we are ! The model is defined !! Now lets train  🙃
