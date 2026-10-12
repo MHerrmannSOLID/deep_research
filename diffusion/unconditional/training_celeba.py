@@ -122,6 +122,14 @@ def postprocess_and_unsquish(tensor_imgs):
 # ---------------------------------------------------------
 # 4. Model, Optimizer, and AMP Setup
 # ---------------------------------------------------------
+# FiLM stands for Feature-wise Linear Modulation (Perez et al., 2017)
+# this is conditioning (scaling ans shifting) the featuremaps of the Unet.
+# In diffusion models, FiLM allows the Unet to adapt its feature processing 
+# based on the current timestep, effectively conditioning the denoising process on time.
+# This is what u find below based on the SinusoidalTime embeddings.
+# For diffusion time embedding are the minimum requirement. This would then be called unconditional diffusion.
+# However, if one also conditions on additional information (like class labels or text embeddings), 
+# it becomes conditional diffusion and such conditions would also be injected into the Unet via the same FiLM mechanism below.
 dim = 96
 film_dim = dim * 4
 film = SinusoidalTimeFiLM(sinusoidal_dim=dim, film_dim=film_dim)
