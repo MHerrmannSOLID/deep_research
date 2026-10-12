@@ -2,28 +2,18 @@ from pathlib import Path
 import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import torch
-import matplotlib.pyplot as plt
 from tqdm import tqdm
-from datasets import load_dataset
-from torch.utils.data import DataLoader
 from torch.optim import AdamW
-from torch.cuda.amp import autocast, GradScaler
-from torchvision import transforms
-from torchvision.transforms import Compose, Resize, RandomHorizontalFlip, ToTensor, Lambda
+from torchvision.transforms import Resize
 from torchvision.utils import save_image
 
 from models.ngu_net import Unet, SinusoidalTimeFiLM
-from diffusion_noise_helper import (
-    extract,
-    p_losses,
-    timesteps,
-    betas,
-    sqrt_one_minus_alphas_cumprod,
-    sqrt_recip_alphas,
-    posterior_variance,
-)
+from image_data_helper import postprocess, load_celeba_dataloader
+from diffusion_noise_helper import p_losses, timesteps
+from sampling_helper import sample
 
 # ---------------------------------------------------------
 # 1. Configuration & Hyperparameters
@@ -42,82 +32,14 @@ results_folder.mkdir(exist_ok=True)
 save_and_sample_every = 1000
 
 # ---------------------------------------------------------
-# 2. Dataset & Transformations
+# 2. Dataset
 # ---------------------------------------------------------
-# Load CelebA from Hugging Face Hub
-dataset = load_dataset("nielsr/CelebA-faces")
-
-# Anamorphic squish to 176x176 square without cropping face features
-transform = Compose([
-    Resize((image_size, image_size)),
-    RandomHorizontalFlip(),
-    ToTensor(),
-    Lambda(lambda t: (t * 2) - 1)  # Scale to [-1, 1]
-])
-
-def transform_images(examples):
-    # Convert images to RGB (CelebA) and apply transformations
-    examples["pixel_values"] = [transform(image.convert("RGB")) for image in examples["image"]]
-    del examples["image"]
-    return examples
-
-transformed_dataset = dataset.with_transform(transform_images)
-
-dataloader = DataLoader(
-    transformed_dataset["train"], 
-    batch_size=micro_batch_size, 
-    shuffle=True,
-    num_workers=0,
-    pin_memory=True
-)
-
-# ---------------------------------------------------------
-# 3. Sampling Utilities
-# ---------------------------------------------------------
-@torch.no_grad()
-def p_sample(model, x, t, t_index):
-    betas_t = extract(betas, t, x.shape)
-    sqrt_one_minus_alphas_cumprod_t = extract(sqrt_one_minus_alphas_cumprod, t, x.shape)
-    sqrt_recip_alphas_t = extract(sqrt_recip_alphas, t, x.shape)
-
-    model_mean = sqrt_recip_alphas_t * (
-        x - betas_t * model(x, t) / sqrt_one_minus_alphas_cumprod_t
-    )
-
-    if t_index == 0:
-        return model_mean
-    else:
-        posterior_variance_t = extract(posterior_variance, t, x.shape)
-        noise = torch.randn_like(x)
-        return model_mean + torch.sqrt(posterior_variance_t) * noise
-
-@torch.no_grad()
-def p_sample_loop(model, shape):
-    device = next(model.parameters()).device
-    b = shape[0]
-    img = torch.randn(shape, device=device)
-    
-    # Run reverse diffusion loop with AMP enabled to speed up sampling
-    for i in tqdm(reversed(range(0, timesteps)), desc='Sampling timestep', total=timesteps, leave=False):
-        img = p_sample(model, img, torch.full((b,), i, device=device, dtype=torch.long), i)
-            
-    return img  # Returns tensor directly on GPU
-
-@torch.no_grad()
-def sample(model, image_size, batch_size=4, channels=3):
-    return p_sample_loop(model, shape=(batch_size, channels, image_size, image_size))
+dataloader = load_celeba_dataloader(image_size, micro_batch_size)
 
 def postprocess_and_unsquish(tensor_imgs):
-    """
-    1. Un-normalize from [-1, 1] to [0, 1]
-    2. Resize from 176x176 square back to original CelebA aspect ratio (178x218)
-    """
-    imgs = (tensor_imgs + 1) * 0.5
-    imgs = torch.clamp(imgs, 0.0, 1.0)
-    
-    # Restore original aspect ratio: height=218, width=178
-    unscale = Resize((218, 178))
-    return unscale(imgs)
+    """Post-process and resize from 128x128 back to original CelebA aspect ratio (178x218)."""
+    imgs = postprocess(tensor_imgs)
+    return Resize((218, 178))(imgs)
 
 # ---------------------------------------------------------
 # 4. Model, Optimizer, and AMP Setup
