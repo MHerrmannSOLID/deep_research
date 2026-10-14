@@ -11,6 +11,15 @@
             "justMyCode": true
         },
         {
+            "name": "Demo: autoencoder-kl-demo",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/stable_diffusion/autoencoder_kl_demo.py",
+            "cwd": "${workspaceFolder}",
+            "console": "integratedTerminal",
+            "justMyCode": true
+        },
+        {
             "name": "Diffusion: Train CelebA (Unconditional)",
             "type": "debugpy",
             "request": "launch",
