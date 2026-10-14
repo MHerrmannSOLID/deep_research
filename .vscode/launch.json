@@ -1,0 +1,32 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Demo: masking-helper",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/diffusion/inpainting/mask_helper.py",
+            "cwd": "${workspaceFolder}",
+            "console": "integratedTerminal",
+            "justMyCode": true
+        },
+        {
+            "name": "Diffusion: Train CelebA (Unconditional)",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/diffusion/unconditional/training_celeba.py",
+            "cwd": "${workspaceFolder}",
+            "console": "integratedTerminal",
+            "justMyCode": true
+        },
+        {
+            "name": "Diffusion: Train CelebA (Inpainting)",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/diffusion/inpainting/training_celeba_inpaint.py",
+            "cwd": "${workspaceFolder}",
+            "console": "integratedTerminal",
+            "justMyCode": true
+        }
+    ]
+}

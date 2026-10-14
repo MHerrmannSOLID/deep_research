@@ -1,10 +1,5 @@
 from pathlib import Path
 import sys
-
-# Project root (for models.ngu_net) and diffusion/ (for diffusion_noise_helper)
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-
 import torch
 import torch.nn.functional as F
 from tqdm import tqdm
@@ -107,7 +102,7 @@ for epoch in range(epochs):
 
     optimizer.zero_grad(set_to_none=True)
 
-    for step, batch in enumerate(tqdm(dataloader, desc="Training")):
+    for step, batch in enumerate(tqdm(dataloader, desc="Training", dynamic_ncols=True)):
         model.train()
 
         batch_images = batch["pixel_values"].to(device)
