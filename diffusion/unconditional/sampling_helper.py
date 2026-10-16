@@ -13,7 +13,7 @@ inference scripts.
 import torch
 from tqdm import tqdm
 
-from diffusion_noise_helper import (
+from .diffusion_noise_helper import (
     extract,
     timesteps,
     betas,
