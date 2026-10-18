@@ -11,6 +11,7 @@ from models.ngu_net import Unet, SinusoidalTimeFiLM
 from diffusion.image_data_helper import load_celeba_dataloader
 from diffusion.unconditional.diffusion_noise_helper import p_losses, timesteps
 from diffusion.unconditional.sampling_helper import sample
+from torch.optim.lr_scheduler import CosineAnnealingLR
 
 # ---------------------------------------------------------
 # 1. Configuration & Hyperparameters
@@ -23,7 +24,7 @@ latent_channels = 4       # SD VAE produces 4-channel latents
 micro_batch_size = 8      # Fits comfortably in 8 GB VRAM
 accumulation_steps = 8    # Effective batch size = 8 * 8 = 64
 learning_rate = 2e-4
-epochs = 8
+epochs = 16
 
 results_folder = Path("./results_celeba_latent")
 results_folder.mkdir(exist_ok=True)
@@ -64,7 +65,7 @@ def decode_and_unsquish(latents):
 # The UNet operates entirely in latent space (4 channels, 24x24).
 # Compared to pixel-space diffusion we use fewer downsampling stages
 # (spatial is already small) but wider channels and more attention.
-dim = 196
+dim = 128
 film_dim = dim * 4
 film = SinusoidalTimeFiLM(sinusoidal_dim=dim, film_dim=film_dim)
 
@@ -75,12 +76,13 @@ model = Unet(
     film_module=film,
     film_dim=film_dim,
     full_attention_count=3,          # Full attention at all 3 stages (no linear attention)
-    attn_heads=8,
-    attn_dim_head=32,
+    attn_heads=6,
+    attn_dim_head=64,
 )
 model.to(device)
 
 optimizer = AdamW(model.parameters(), lr=learning_rate, weight_decay=1e-4)
+scheduler = CosineAnnealingLR(optimizer,eta_min=1e-6, T_max=epochs)
 
 # ---------------------------------------------------------
 # 5. Training Loop
@@ -138,7 +140,7 @@ for epoch in range(epochs):
                 # Post-processing: VAE decode + un-squish to 178x218 aspect ratio
                 final_grid = decode_and_unsquish(sampled_latents)
                 save_image(final_grid, str(results_folder / f'sample-{milestone}.png'), nrow=2)
-
+    scheduler.step()
 
 # ---------------------------------------------------------
 # 6. Final Evaluation & Sampling
