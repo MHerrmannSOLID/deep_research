@@ -21,7 +21,7 @@ device = "cuda" if torch.cuda.is_available() else "cpu"
 image_size = 192          # 192x192 pixels → 24x24 latents (VAE downsamples 8x)
 latent_size = image_size // 8
 latent_channels = 4       # SD VAE produces 4-channel latents
-micro_batch_size = 8      # Fits comfortably in 8 GB VRAM
+micro_batch_size = 16      # Fits comfortably in 8 GB VRAM
 accumulation_steps = 8    # Effective batch size = 8 * 8 = 64
 learning_rate = 2e-4
 epochs = 16
@@ -65,19 +65,19 @@ def decode_and_unsquish(latents):
 # The UNet operates entirely in latent space (4 channels, 24x24).
 # Compared to pixel-space diffusion we use fewer downsampling stages
 # (spatial is already small) but wider channels and more attention.
-dim = 128
+dim = 96
 film_dim = dim * 4
 film = SinusoidalTimeFiLM(sinusoidal_dim=dim, film_dim=film_dim)
 
 model = Unet(
     dim=dim,                         # Base feature width
     channels=latent_channels,        # 4 VAE latent channels
-    dim_mults=(2, 4, 8),             # Downsamples: 24 → 12 → 6, bottleneck at 6x6
+    dim_mults=(2, 4, 6),             # Downsamples: 24 → 12 → 6, bottleneck at 6x6
     film_module=film,
     film_dim=film_dim,
     full_attention_count=3,          # Full attention at all 3 stages (no linear attention)
     attn_heads=6,
-    attn_dim_head=64,
+    attn_dim_head=32,
 )
 model.to(device)
 
