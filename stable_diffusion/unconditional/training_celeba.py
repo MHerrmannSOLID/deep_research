@@ -3,12 +3,12 @@ from pathlib import Path
 import torch
 from tqdm import tqdm
 from torch.optim import AdamW
+from torch.utils.data import DataLoader, TensorDataset
 from torchvision.transforms import Resize
 from torchvision.utils import save_image
 from diffusers import AutoencoderKL
 
 from models.ngu_net import Unet, SinusoidalTimeFiLM
-from diffusion.image_data_helper import load_celeba_dataloader
 from diffusion.unconditional.diffusion_noise_helper import p_losses, timesteps
 from diffusion.unconditional.sampling_helper import sample
 from torch.optim.lr_scheduler import CosineAnnealingLR
@@ -18,20 +18,19 @@ from torch.optim.lr_scheduler import CosineAnnealingLR
 # ---------------------------------------------------------
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
-image_size = 192          # 192x192 pixels → 24x24 latents (VAE downsamples 8x)
-latent_size = image_size // 8
+latent_size = 24          # 192x192 pixels → 24x24 latents (VAE downsamples 8x)
 latent_channels = 4       # SD VAE produces 4-channel latents
-micro_batch_size = 16      # Fits comfortably in 8 GB VRAM
-accumulation_steps = 8    # Effective batch size = 8 * 8 = 64
+micro_batch_size = 16
+accumulation_steps = 8    # Effective batch size = 16 * 8 = 128
 learning_rate = 2e-4
-epochs = 16
+epochs = 200
 
 results_folder = Path("./results_celeba_latent")
 results_folder.mkdir(exist_ok=True)
-save_and_sample_every = 1000
+save_and_sample_every = 10000
 
 # ---------------------------------------------------------
-# 2. VAE (frozen encoder/decoder for pre/post-processing)
+# 2. VAE decoder (for sampling/visualization only)
 # ---------------------------------------------------------
 vae_model_id = "stabilityai/sd-vae-ft-mse"
 vae = AutoencoderKL.from_pretrained(vae_model_id, torch_dtype=torch.float32).to(device)
@@ -41,15 +40,6 @@ for p in vae.parameters():
 
 vae_scaling_factor = vae.config.scaling_factor
 
-# ---------------------------------------------------------
-# 3. Dataset
-# ---------------------------------------------------------
-dataloader = load_celeba_dataloader(image_size, micro_batch_size)
-
-@torch.no_grad()
-def encode_to_latent(pixel_images):
-    return vae.encode(pixel_images).latent_dist.sample() * vae_scaling_factor
-
 @torch.no_grad()
 def decode_latents(latents):
     decoded = vae.decode(latents / vae_scaling_factor).sample
@@ -58,6 +48,18 @@ def decode_latents(latents):
 def decode_and_unsquish(latents):
     imgs = decode_latents(latents)
     return Resize((218, 178))(imgs)
+
+# ---------------------------------------------------------
+# 3. Dataset (pre-encoded latents)
+# ---------------------------------------------------------
+latents_path = Path("./celeba_latents.pt")
+all_latents = torch.load(latents_path, weights_only=True)
+dataloader = DataLoader(
+    TensorDataset(all_latents),
+    batch_size=micro_batch_size,
+    shuffle=True,
+    pin_memory=True,
+)
 
 # ---------------------------------------------------------
 # 4. Model, Optimizer
@@ -100,14 +102,11 @@ for epoch in range(epochs):
 
     optimizer.zero_grad(set_to_none=True)
 
-    for step, batch in enumerate(tqdm(dataloader, desc="Training", dynamic_ncols=True)):
+    for step, (latents,) in enumerate(tqdm(dataloader, desc="Training", dynamic_ncols=True)):
         model.train()
 
-        batch_images = batch["pixel_values"].to(device)
-        b_size = batch_images.shape[0]
-
-        # Pre-processing: encode pixels to latent space using frozen VAE
-        latents = encode_to_latent(batch_images)
+        latents = latents.to(device)
+        b_size = latents.shape[0]
 
         # Sample uniform timestep t for each image in batch
         t = torch.randint(0, timesteps, (b_size,), device=device).long()
