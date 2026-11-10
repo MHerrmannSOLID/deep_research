@@ -1,5 +1,4 @@
 from pathlib import Path
-import sys
 import torch
 import torch.nn.functional as F
 from tqdm import tqdm
@@ -7,10 +6,10 @@ from torch.optim import AdamW
 from torchvision.utils import save_image
 
 from models.ngu_net import Unet, SinusoidalTimeFiLM
-from image_data_helper import postprocess, load_celeba_dataloader
-from diffusion_noise_helper import q_sample, timesteps
-from mask_helper import create_inpainting_conditioning
-from sampling_helper import sample
+from diffusion.image_data_helper import postprocess, load_celeba_dataloader
+from diffusion.unconditional.diffusion_noise_helper import q_sample, timesteps
+from diffusion.inpainting.mask_helper import create_inpainting_conditioning
+from diffusion.inpainting.sampling_helper import sample
 
 # ---------------------------------------------------------
 # 1. Configuration & Hyperparameters

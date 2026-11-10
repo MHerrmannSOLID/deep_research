@@ -13,15 +13,10 @@ Used by both the training script (periodic sample generation) and standalone
 inference scripts.
 """
 
-import sys
-from pathlib import Path
-
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-
 import torch
 from tqdm import tqdm
 
-from diffusion_noise_helper import (
+from diffusion.unconditional.diffusion_noise_helper import (
     extract,
     timesteps,
     betas,
